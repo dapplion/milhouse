@@ -164,6 +164,12 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
         self.interface.apply_updates()
     }
 
+    /// This method exists for testing purposes.
+    #[doc(hidden)]
+    pub fn apply_recursive_updates(&mut self) -> Result<(), Error> {
+        self.interface.apply_recursive_updates()
+    }
+
     pub fn bulk_update(&mut self, updates: U) -> Result<(), Error> {
         self.interface.bulk_update(updates)
     }

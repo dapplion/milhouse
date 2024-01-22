@@ -38,3 +38,7 @@ harness = false
 [[bench]]
 name = "ssz"
 harness = false
+
+[[bench]]
+name = "updates"
+harness = false
