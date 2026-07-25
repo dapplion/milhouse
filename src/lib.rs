@@ -3,6 +3,7 @@
 
 pub mod builder;
 pub mod cow;
+pub mod diff;
 pub mod error;
 pub mod interface;
 pub mod interface_iter;

@@ -16,6 +16,7 @@ pub enum Error {
     UpdateLeafError,
     UpdateLeavesError,
     InvalidRebaseNode,
+    PendingUpdates,
     InvalidRebaseLeaf,
     BuilderInvalidDepth { depth: usize },
     BuilderExpectedLeaf,
