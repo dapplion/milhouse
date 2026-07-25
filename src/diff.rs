@@ -73,13 +73,7 @@ fn for_each_changed_node<T: Value>(
             };
             let half = 1usize << depth.saturating_sub(1);
             for_each_changed_node(base_left, left, depth.saturating_sub(1), offset, f);
-            for_each_changed_node(
-                base_right,
-                right,
-                depth.saturating_sub(1),
-                offset + half,
-                f,
-            );
+            for_each_changed_node(base_right, right, depth.saturating_sub(1), offset + half, f);
         }
         Tree::Leaf(leaf) => {
             let base_value = match base.map(|b| b.as_ref()) {
