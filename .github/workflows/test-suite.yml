@@ -14,16 +14,18 @@ jobs:
     name: cargo-fmt
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Get latest version of stable Rust
       run: rustup update stable
     - name: Check formatting with cargo fmt
       run: cargo fmt --all -- --check
+    - name: Check fuzzer formatting with cargo fmt
+      run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Get latest version of stable Rust
       run: rustup update stable
     - name: Lint code for quality and style with Clippy
@@ -35,10 +37,33 @@ jobs:
     runs-on: ${{ matrix.os }}
     name: test-${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Get latest version of stable Rust
       run: rustup update stable
+    - name: Get latest version of nightly Rust
+      run: rustup update nightly
     - name: Run tests
       run: cargo test --release
     - name: Check all examples, binaries, etc
       run: cargo check --all-targets
+    - name: Check fuzzer targets
+      if: matrix.os != 'windows-latest'
+      run: cargo +nightly check --manifest-path fuzz/Cargo.toml --all-targets
+  coverage:
+    name: cargo-tarpaulin
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Get latest version of stable Rust
+      run: rustup update stable
+    - name: Install cargo-tarpaulin
+      uses: taiki-e/install-action@cargo-tarpaulin
+    - name: Check code coverage with cargo-tarpaulin
+      # Using --lib to avoid DHAT issues
+      run: cargo-tarpaulin --workspace --all-features --out xml --lib --timeout 1200
+    - name: Upload to codecov.io
+      uses: codecov/codecov-action@v4
+      with:
+        fail_ci_if_error: false
+        token: ${{ secrets.CODECOV_TOKEN }}
+        informational: true

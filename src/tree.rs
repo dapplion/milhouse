@@ -1,25 +1,26 @@
-use crate::utils::{arb_arc, arb_rwlock, opt_hash, opt_packing_depth, opt_packing_factor, Length};
+use crate::utils::{Length, opt_hash, opt_packing_depth, opt_packing_factor};
 use crate::{Arc, Error, Leaf, PackedLeaf, UpdateMap, Value};
-use arbitrary::Arbitrary;
-use derivative::Derivative;
-use ethereum_hashing::{hash32_concat, ZERO_HASHES};
+use educe::Educe;
+use ethereum_hashing::{ZERO_HASHES, hash32_concat};
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 use tree_hash::Hash256;
 
-#[derive(Debug, Derivative, Arbitrary)]
-#[derivative(PartialEq, Hash)]
+#[derive(Debug, Educe)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[educe(PartialEq(bound(T: Value)), Hash)]
 pub enum Tree<T: Value> {
     Leaf(Leaf<T>),
     PackedLeaf(PackedLeaf<T>),
     Node {
-        #[derivative(PartialEq = "ignore", Hash = "ignore")]
-        #[arbitrary(with = arb_rwlock)]
+        #[educe(PartialEq(ignore), Hash(ignore))]
+        #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_rwlock))]
         hash: RwLock<Hash256>,
-        #[arbitrary(with = arb_arc)]
+        #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_arc))]
         left: Arc<Self>,
-        #[arbitrary(with = arb_arc)]
+        #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_arc))]
         right: Arc<Self>,
     },
     Zero(usize),
@@ -67,7 +68,7 @@ impl<T: Value> Tree<T> {
 
     pub fn node_unboxed(left: Arc<Self>, right: Arc<Self>) -> Self {
         Self::Node {
-            hash: RwLock::new(Hash256::zero()),
+            hash: RwLock::new(Hash256::ZERO),
             left,
             right,
         }
@@ -124,14 +125,14 @@ impl<T: Value> Tree<T> {
                     Ok(Self::node(
                         left.with_updated_leaf(index, new_value, new_depth)?,
                         right.clone(),
-                        Hash256::zero(),
+                        Hash256::ZERO,
                     ))
                 } else {
                     // Index lies on the right, recurse right
                     Ok(Self::node(
                         left.clone(),
                         right.with_updated_leaf(index, new_value, new_depth)?,
-                        Hash256::zero(),
+                        Hash256::ZERO,
                     ))
                 }
             }
@@ -146,7 +147,7 @@ impl<T: Value> Tree<T> {
                     // Split zero node into a node with left and right, and recurse into
                     // the appropriate subtree
                     let new_zero = Self::zero(depth - 1);
-                    Self::node(new_zero.clone(), new_zero, Hash256::zero())
+                    Self::node(new_zero.clone(), new_zero, Hash256::ZERO)
                         .with_updated_leaf(index, new_value, depth)
                 }
             }
@@ -234,6 +235,19 @@ impl<T: Value> Tree<T> {
             _ => Err(Error::UpdateLeavesError),
         }
     }
+
+    /// Compute the number of elements stored in this subtree.
+    ///
+    /// This method should be avoided if possible. Prefer to read the length cached in a `List` or
+    /// similar.
+    pub fn compute_len(&self) -> usize {
+        match self {
+            Self::Leaf(_) => 1,
+            Self::PackedLeaf(leaf) => leaf.values.len(),
+            Self::Node { left, right, .. } => left.compute_len() + right.compute_len(),
+            Self::Zero(_) => 0,
+        }
+    }
 }
 
 pub enum RebaseAction<'a, T> {
@@ -245,6 +259,11 @@ pub enum RebaseAction<'a, T> {
     EqualNoop,
     // Nodes are exactly equal and `new` should be replaced by the given node.
     EqualReplace(&'a Arc<T>),
+}
+
+pub enum IntraRebaseAction<T> {
+    Noop,
+    Replace(Arc<T>),
 }
 
 impl<T: Value> Tree<T> {
@@ -276,13 +295,13 @@ impl<T: Value> Tree<T> {
             (
                 Self::Node {
                     hash: orig_hash_lock,
-                    left: ref l1,
-                    right: ref r1,
+                    left: l1,
+                    right: r1,
                 },
                 Self::Node {
                     hash: base_hash_lock,
-                    left: ref l2,
-                    right: ref r2,
+                    left: l2,
+                    right: r2,
                 },
             ) if full_depth > 0 => {
                 use RebaseAction::*;
@@ -295,9 +314,7 @@ impl<T: Value> Tree<T> {
                 // then we know they are already equal (e.g. we're in a vector).
                 if !orig_hash.is_zero()
                     && orig_hash == base_hash
-                    && lengths.map_or(true, |(orig_length, base_length)| {
-                        orig_length == base_length
-                    })
+                    && lengths.is_none_or(|(orig_length, base_length)| orig_length == base_length)
                 {
                     return Ok(EqualReplace(base));
                 }
@@ -389,6 +406,89 @@ impl<T: Value> Tree<T> {
             }
         }
     }
+
+    /// Exploit structural sharing between identical parts of the tree.
+    ///
+    /// This method traverses a fully-hashed tree and replaces identical subtrees with clones of
+    /// the first equal subtree. The result is a tree that shares memory for common subtrees, and
+    /// thus uses less memory overall.
+    ///
+    /// You MUST pass a fully-hashed tree to this function, or an `Error::IntraRebaseZeroHash`
+    /// error will be returned.
+    ///
+    /// Arguments are:
+    ///
+    /// - `orig`: The tree to rebase.
+    /// - `known_subtrees`: map from `(depth, tree_hash_root)` to `Arc<Node>`. This should be empty
+    ///   for the top-level call. The recursive calls fill it in. It can be discarded after the
+    ///   method returns.
+    /// - `current_depth`: The depth of the tree `orig`. This will be decremented as we recurse
+    ///   down the tree towards the leaves.
+    ///
+    /// Presently leaves are left untouched by this procedure, so it will only produce savings in
+    /// trees with equal internal nodes (i.e. equal subtrees with at least two leaves/packed leaves
+    /// under them).
+    ///
+    /// The input tree must be fully-hashed, and the result will also remain fully-hashed.
+    pub fn intra_rebase(
+        orig: &Arc<Self>,
+        known_subtrees: &mut HashMap<(usize, Hash256), Arc<Self>>,
+        current_depth: usize,
+    ) -> Result<IntraRebaseAction<Self>, Error> {
+        match &**orig {
+            Self::Leaf(_) | Self::PackedLeaf(_) | Self::Zero(_) => Ok(IntraRebaseAction::Noop),
+            Self::Node { hash, left, right } if current_depth > 0 => {
+                let hash = *hash.read();
+
+                // Tree must be fully hashed prior to intra-rebase.
+                if hash.is_zero() {
+                    return Err(Error::IntraRebaseZeroHash);
+                }
+
+                if let Some(known_subtree) = known_subtrees.get(&(current_depth, hash)) {
+                    // Node is already known from elsewhere in the tree. We can replace it without
+                    // looking at further subtrees.
+                    return Ok(IntraRebaseAction::Replace(known_subtree.clone()));
+                }
+
+                let left_action = Self::intra_rebase(left, known_subtrees, current_depth - 1)?;
+                let right_action = Self::intra_rebase(right, known_subtrees, current_depth - 1)?;
+
+                let action = match (left_action, right_action) {
+                    (IntraRebaseAction::Noop, IntraRebaseAction::Noop) => IntraRebaseAction::Noop,
+                    (IntraRebaseAction::Noop, IntraRebaseAction::Replace(new_right)) => {
+                        IntraRebaseAction::Replace(Self::node(left.clone(), new_right, hash))
+                    }
+                    (IntraRebaseAction::Replace(new_left), IntraRebaseAction::Noop) => {
+                        IntraRebaseAction::Replace(Self::node(new_left, right.clone(), hash))
+                    }
+                    (
+                        IntraRebaseAction::Replace(new_left),
+                        IntraRebaseAction::Replace(new_right),
+                    ) => IntraRebaseAction::Replace(Self::node(new_left, new_right, hash)),
+                };
+
+                // Add the new version of this node to the known subtrees.
+                let new_subtree = match &action {
+                    // `orig` has not been seen in this traversal and will not change, so we add it
+                    // to the map.
+                    IntraRebaseAction::Noop => orig.clone(),
+                    IntraRebaseAction::Replace(new) => new.clone(),
+                };
+                let existing_entry = known_subtrees.insert((current_depth, hash), new_subtree);
+
+                // We should not add any identical node to the `known_subtrees` more than once.
+                // This indicates an error in this method's implementation or the map passed in not
+                // being empty.
+                if existing_entry.is_some() {
+                    return Err(Error::IntraRebaseRepeatVisit);
+                }
+
+                Ok(action)
+            }
+            Self::Node { .. } => Err(Error::IntraRebaseZeroDepth),
+        }
+    }
 }
 
 impl<T: Value + Send + Sync> Tree<T> {
@@ -416,7 +516,7 @@ impl<T: Value + Send + Sync> Tree<T> {
                 }
             }
             Self::PackedLeaf(leaf) => leaf.tree_hash(),
-            Self::Zero(depth) => Hash256::from_slice(&ZERO_HASHES[*depth]),
+            Self::Zero(depth) => Hash256::from(ZERO_HASHES[*depth]),
             Self::Node { hash, left, right } => {
                 let read_lock = hash.read();
                 let existing_hash = *read_lock;
@@ -429,7 +529,7 @@ impl<T: Value + Send + Sync> Tree<T> {
                     let (left_hash, right_hash) =
                         rayon::join(|| left.tree_hash(), || right.tree_hash());
                     let tree_hash =
-                        Hash256::from(hash32_concat(left_hash.as_bytes(), right_hash.as_bytes()));
+                        Hash256::from(hash32_concat(left_hash.as_slice(), right_hash.as_slice()));
                     *hash.write() = tree_hash;
                     tree_hash
                 }

@@ -16,7 +16,9 @@ pub enum Error {
     UpdateLeafError,
     UpdateLeavesError,
     InvalidRebaseNode,
+    PendingUpdates,
     InvalidRebaseLeaf,
+    BuilderInvalidDepth { depth: usize },
     BuilderExpectedLeaf,
     BuilderStackEmptyMerge,
     BuilderStackEmptyMergeLeft,
@@ -26,12 +28,17 @@ pub enum Error {
     BuilderStackEmptyFinishRight,
     BuilderStackEmptyFinalize,
     BuilderStackLeftover,
+    BuilderFull,
     BulkUpdateUnclean,
     CowMissingEntry,
+    LevelIterPendingUpdates,
+    IntraRebaseZeroHash,
+    IntraRebaseZeroDepth,
+    IntraRebaseRepeatVisit,
 }
 
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter) -> Result<(), FmtError> {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }

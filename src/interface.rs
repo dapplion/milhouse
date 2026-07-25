@@ -1,11 +1,11 @@
+use crate::level_iter::LevelIter;
 use crate::update_map::UpdateMap;
-use crate::utils::{updated_length, Length};
+use crate::utils::{Length, updated_length};
 use crate::{
+    Cow, Error, Value,
     interface_iter::{InterfaceIter, InterfaceIterCow},
     iter::Iter,
-    Cow, Error, Value,
 };
-use arbitrary::Arbitrary;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use tree_hash::Hash256;
@@ -19,7 +19,9 @@ pub trait ImmList<T: Value> {
         self.len().as_usize() == 0
     }
 
-    fn iter_from(&self, index: usize) -> Iter<T>;
+    fn iter_from(&self, index: usize) -> Iter<'_, T>;
+
+    fn level_iter_from(&self, index: usize) -> LevelIter<'_, T>;
 }
 
 pub trait MutList<T: Value>: ImmList<T> {
@@ -32,7 +34,8 @@ pub trait MutList<T: Value>: ImmList<T> {
     ) -> Result<(), Error>;
 }
 
-#[derive(Debug, PartialEq, Clone, Arbitrary)]
+#[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Interface<T, B, U>
 where
     T: Value,
@@ -67,7 +70,7 @@ where
             .get_mut_with(idx, |idx| self.backing.get(idx).cloned())
     }
 
-    pub fn get_cow(&mut self, index: usize) -> Option<Cow<T>> {
+    pub fn get_cow(&mut self, index: usize) -> Option<Cow<'_, T>> {
         self.updates
             .get_cow_with(index, |idx| self.backing.get(idx))
     }
@@ -93,11 +96,11 @@ where
         !self.updates.is_empty()
     }
 
-    pub fn iter(&self) -> InterfaceIter<T, U> {
+    pub fn iter(&self) -> InterfaceIter<'_, T, U> {
         self.iter_from(0)
     }
 
-    pub fn iter_from(&self, index: usize) -> InterfaceIter<T, U> {
+    pub fn iter_from(&self, index: usize) -> InterfaceIter<'_, T, U> {
         InterfaceIter {
             tree_iter: self.backing.iter_from(index),
             updates: &self.updates,
@@ -106,12 +109,23 @@ where
         }
     }
 
-    pub fn iter_cow(&mut self) -> InterfaceIterCow<T, U> {
-        let index = 0;
+    pub fn iter_cow(&mut self) -> InterfaceIterCow<'_, T, U> {
+        self.iter_cow_from(0)
+    }
+
+    pub fn iter_cow_from(&mut self, index: usize) -> InterfaceIterCow<'_, T, U> {
         InterfaceIterCow {
             tree_iter: self.backing.iter_from(index),
             updates: &mut self.updates,
             index,
+        }
+    }
+
+    pub fn level_iter_from(&self, index: usize) -> Result<LevelIter<'_, T>, Error> {
+        if self.has_pending_updates() {
+            Err(Error::LevelIterPendingUpdates)
+        } else {
+            Ok(self.backing.level_iter_from(index))
         }
     }
 
@@ -187,5 +201,17 @@ mod test {
         }
 
         assert_eq!(list.to_vec(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn cow_iter_from() {
+        let mut list = List::<u64, U8>::new(vec![1, 2, 3, 4, 5]).unwrap();
+
+        let mut iter = list.iter_cow_from(2).unwrap();
+        while let Some((index, v)) = iter.next_cow() {
+            *v.into_mut().unwrap() = (index * 10) as u64;
+        }
+
+        assert_eq!(list.to_vec(), vec![1, 2, 20, 30, 40]);
     }
 }

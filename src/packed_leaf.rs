@@ -1,17 +1,17 @@
-use crate::{utils::arb_rwlock, Error, UpdateMap};
-use arbitrary::Arbitrary;
-use derivative::Derivative;
+use crate::{Error, UpdateMap};
+use educe::Educe;
 use parking_lot::RwLock;
 use std::ops::ControlFlow;
-use tree_hash::{Hash256, TreeHash, BYTES_PER_CHUNK};
+use tree_hash::{BYTES_PER_CHUNK, Hash256, TreeHash};
 
-#[derive(Debug, Derivative, Arbitrary)]
-#[derivative(PartialEq, Hash)]
+#[derive(Debug, Educe)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[educe(PartialEq, Hash)]
 pub struct PackedLeaf<T: TreeHash + Clone> {
-    #[derivative(PartialEq = "ignore", Hash = "ignore")]
-    #[arbitrary(with = arb_rwlock)]
+    #[educe(PartialEq(ignore), Hash(ignore))]
+    #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_rwlock))]
     pub hash: RwLock<Hash256>,
-    pub(crate) values: Vec<T>,
+    pub values: Vec<T>,
 }
 
 impl<T> Clone for PackedLeaf<T>
@@ -36,7 +36,7 @@ impl<T: TreeHash + Clone> PackedLeaf<T> {
             return hash;
         }
 
-        let hash_bytes = hash.as_bytes_mut();
+        let hash_bytes = hash.as_mut_slice();
 
         let value_len = BYTES_PER_CHUNK / T::tree_hash_packing_factor();
         for (i, value) in self.values.iter().enumerate() {
@@ -50,7 +50,7 @@ impl<T: TreeHash + Clone> PackedLeaf<T> {
 
     pub fn empty() -> Self {
         PackedLeaf {
-            hash: RwLock::new(Hash256::zero()),
+            hash: RwLock::new(Hash256::ZERO),
             values: Vec::with_capacity(T::tree_hash_packing_factor()),
         }
     }
@@ -60,7 +60,7 @@ impl<T: TreeHash + Clone> PackedLeaf<T> {
         values.push(value);
 
         PackedLeaf {
-            hash: RwLock::new(Hash256::zero()),
+            hash: RwLock::new(Hash256::ZERO),
             values,
         }
     }
@@ -68,14 +68,14 @@ impl<T: TreeHash + Clone> PackedLeaf<T> {
     pub fn repeat(value: T, n: usize) -> Self {
         assert!(n <= T::tree_hash_packing_factor());
         PackedLeaf {
-            hash: RwLock::new(Hash256::zero()),
+            hash: RwLock::new(Hash256::ZERO),
             values: vec![value; n],
         }
     }
 
     pub fn insert_at_index(&self, index: usize, value: T) -> Result<Self, Error> {
         let mut updated = PackedLeaf {
-            hash: RwLock::new(Hash256::zero()),
+            hash: RwLock::new(Hash256::ZERO),
             values: self.values.clone(),
         };
         let sub_index = index % T::tree_hash_packing_factor();
@@ -105,7 +105,7 @@ impl<T: TreeHash + Clone> PackedLeaf<T> {
 
     pub fn insert_mut(&mut self, sub_index: usize, value: T) -> Result<(), Error> {
         // Ensure hash is 0.
-        *self.hash.get_mut() = Hash256::zero();
+        *self.hash.get_mut() = Hash256::ZERO;
 
         if sub_index == self.values.len() {
             self.values.push(value);

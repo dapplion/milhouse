@@ -1,31 +1,45 @@
 [package]
 name = "milhouse"
-version = "0.1.0"
+version = "0.9.0"
 description = "Persistent binary merkle tree"
-edition = "2021"
+edition = "2024"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/sigp/milhouse"
+documentation = "https://docs.rs/milhouse"
+keywords = ["ethereum", "functional"]
+categories = ["data-structures", "cryptography::cryptocurrencies"]
+
+[features]
+debug = []
+arbitrary = ["dep:arbitrary", "alloy-primitives/arbitrary"]
+context_deserialize = ["dep:context_deserialize"]
 
 [dependencies]
-derivative = "2.2.0"
-ethereum_hashing = "1.0.0-beta.2"
-ethereum_ssz = "0.5.0"
-ethereum_ssz_derive = "0.5.0"
-itertools = "0.10.3"
-parking_lot = "0.11.2"
+educe = "0.6.0"
+ethereum_hashing = "0.8"
+ethereum_ssz = "0.10"
+ethereum_ssz_derive = "0.10"
+itertools = "0.13.0"
+parking_lot = "0.12.1"
 rayon = "1.5.1"
 serde = { version = "1.0.0", features = ["derive"] }
-tree_hash = "0.5.0"
+tree_hash = "0.12"
 triomphe = "0.1.5"
 typenum = "1.14.0"
 vec_map = "0.8.2"
 smallvec = "1.8.0"
-arbitrary = { version = "1.2.3", features = ["derive"] }
-ethereum-types = { version = "0.14.1", features = ["arbitrary"] }
+arbitrary = { version = "1.2.3", features = ["derive"], optional = true }
+alloy-primitives = { version = "1.0.0" }
+context_deserialize = { version = "0.2", optional = true }
 
 [dev-dependencies]
-ssz_types = "0.5.0"
+ssz_types = "0.14"
 proptest = "1.0.0"
-tree_hash_derive = "0.5.0"
-criterion = "0.3"
+tree_hash_derive = "0.12"
+criterion = "0.8"
+dhat = "0.3.3"
+serde_json = "1.0.0"
 
 [[bench]]
 name = "rebase"
@@ -38,3 +52,14 @@ harness = false
 [[bench]]
 name = "ssz"
 harness = false
+
+[[bench]]
+name = "pop_front"
+harness = false
+
+[[bench]]
+name = "cow_bytes"
+harness = false
+
+[profile.bench]
+debug = true

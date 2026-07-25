@@ -1,42 +1,52 @@
 use crate::interface::{ImmList, Interface, MutList};
-use crate::interface_iter::InterfaceIter;
+use crate::interface_iter::{InterfaceIter, InterfaceIterCow};
 use crate::iter::Iter;
-use crate::tree::RebaseAction;
+use crate::level_iter::LevelIter;
+use crate::tree::{IntraRebaseAction, RebaseAction};
 use crate::update_map::MaxMap;
-use crate::utils::{arb_arc, Length};
+use crate::utils::Length;
 use crate::{Arc, Cow, Error, List, Tree, UpdateMap, Value};
+#[cfg(feature = "arbitrary")]
 use arbitrary::Arbitrary;
-use derivative::Derivative;
+use educe::Educe;
 use serde::{Deserialize, Serialize};
-use ssz::{Decode, Encode, SszEncoder, TryFromIter, BYTES_PER_LENGTH_OFFSET};
-use std::collections::BTreeMap;
+use ssz::{BYTES_PER_LENGTH_OFFSET, Decode, Encode, SszEncoder, TryFromIter};
+use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
 use std::marker::PhantomData;
-use tree_hash::{Hash256, PackedEncoding};
+use tree_hash::{Hash256, PackedEncoding, TreeHash};
 use typenum::Unsigned;
 use vec_map::VecMap;
 
-#[derive(Debug, Derivative, Clone, Serialize, Deserialize, Arbitrary)]
-#[derivative(PartialEq(bound = "T: Value, N: Unsigned, U: UpdateMap<T> + PartialEq"))]
+#[derive(Debug, Educe, Clone, Serialize, Deserialize)]
+#[educe(PartialEq(bound(T: Value, N: Unsigned, U: UpdateMap<T> + PartialEq)))]
 #[serde(try_from = "List<T, N, U>")]
 #[serde(into = "List<T, N, U>")]
 #[serde(bound(serialize = "T: Value + Serialize, N: Unsigned, U: UpdateMap<T>"))]
 #[serde(bound(deserialize = "T: Value + Deserialize<'de>, N: Unsigned, U: UpdateMap<T>"))]
-#[arbitrary(bound = "T: Arbitrary<'arbitrary> + Value")]
-#[arbitrary(bound = "N: Unsigned, U: Arbitrary<'arbitrary> + UpdateMap<T>")]
+#[cfg_attr(
+    feature = "arbitrary",
+    derive(Arbitrary),
+    arbitrary(bound = "T: Arbitrary<'arbitrary> + Value"),
+    arbitrary(bound = "N: Unsigned, U: Arbitrary<'arbitrary> + UpdateMap<T>")
+)]
 pub struct Vector<T: Value, N: Unsigned, U: UpdateMap<T> = MaxMap<VecMap<T>>> {
     pub(crate) interface: Interface<T, VectorInner<T, N>, U>,
 }
 
-#[derive(Debug, Derivative, Clone, Arbitrary)]
-#[derivative(PartialEq(bound = "T: Value, N: Unsigned"))]
-#[arbitrary(bound = "T: Arbitrary<'arbitrary> + Value, N: Unsigned")]
+#[derive(Debug, Educe, Clone)]
+#[educe(PartialEq(bound(T: Value, N: Unsigned)))]
+#[cfg_attr(
+    feature = "arbitrary",
+    derive(Arbitrary),
+    arbitrary(bound = "T: Arbitrary<'arbitrary> + Value, N: Unsigned")
+)]
 pub struct VectorInner<T: Value, N: Unsigned> {
-    #[arbitrary(with = arb_arc)]
+    #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_arc))]
     pub(crate) tree: Arc<Tree<T>>,
     pub(crate) depth: usize,
     packing_depth: usize,
-    #[arbitrary(default)]
+    #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     _phantom: PhantomData<N>,
 }
 
@@ -64,11 +74,11 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> Vector<T, N, U> {
         self.iter().cloned().collect()
     }
 
-    pub fn iter(&self) -> InterfaceIter<T, U> {
+    pub fn iter(&self) -> InterfaceIter<'_, T, U> {
         self.interface.iter()
     }
 
-    pub fn iter_from(&self, index: usize) -> Result<InterfaceIter<T, U>, Error> {
+    pub fn iter_from(&self, index: usize) -> Result<InterfaceIter<'_, T, U>, Error> {
         if index > self.len() {
             return Err(Error::OutOfBoundsIterFrom {
                 index,
@@ -78,16 +88,42 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> Vector<T, N, U> {
         Ok(self.interface.iter_from(index))
     }
 
+    pub fn iter_cow(&mut self) -> InterfaceIterCow<'_, T, U> {
+        self.interface.iter_cow()
+    }
+
+    pub fn iter_cow_from(&mut self, index: usize) -> Result<InterfaceIterCow<'_, T, U>, Error> {
+        if index > self.len() {
+            return Err(Error::OutOfBoundsIterFrom {
+                index,
+                len: self.len(),
+            });
+        }
+        Ok(self.interface.iter_cow_from(index))
+    }
+
+    /// Compute the bytes owned by `self` that are not shared with `base`.
+    ///
+    /// O(dirty_nodes) — shared subtrees are skipped via `Arc::ptr_eq`.
+    pub fn cow_bytes(&self, base: &Self) -> usize {
+        crate::mem::cow_tree_bytes(&base.interface.backing.tree, &self.interface.backing.tree)
+    }
+
+    /// Total bytes of all tree nodes (no sharing baseline).
+    pub fn total_tree_bytes(&self) -> usize {
+        crate::mem::total_tree_bytes(&self.interface.backing.tree)
+    }
+
     // Wrap trait methods so we present a Vec-like interface without having to import anything.
-    pub fn get(&self, index: usize) -> Option<&T> {
+    pub fn get(&self, index: usize) -> Option<&'_ T> {
         self.interface.get(index)
     }
 
-    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+    pub fn get_mut(&mut self, index: usize) -> Option<&'_ mut T> {
         self.interface.get_mut(index)
     }
 
-    pub fn get_cow(&mut self, index: usize) -> Option<Cow<T>> {
+    pub fn get_cow(&mut self, index: usize) -> Option<Cow<'_, T>> {
         self.interface.get_cow(index)
     }
 
@@ -162,6 +198,25 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> Vector<T, N, U> {
     }
 }
 
+impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>> Vector<T, N, U> {
+    pub fn intra_rebase(&mut self) -> Result<(), Error> {
+        // We need to be fully hashed in order to intra-rebase. To avoid putting this burden on the
+        // caller, just do it here. If we're already fully-hashed this should be quick.
+        self.apply_updates()?;
+        self.tree_hash_root();
+
+        let mut known_subtrees = HashMap::new();
+        if let IntraRebaseAction::Replace(new_tree) = Tree::intra_rebase(
+            &self.interface.backing.tree,
+            &mut known_subtrees,
+            self.interface.backing.depth,
+        )? {
+            self.interface.backing.tree = new_tree;
+        }
+        Ok(())
+    }
+}
+
 impl<T: Value, N: Unsigned, U: UpdateMap<T>> From<Vector<T, N, U>> for List<T, N, U> {
     fn from(vector: Vector<T, N, U>) -> Self {
         let mut list = List::from_parts(
@@ -188,8 +243,12 @@ impl<T: Value, N: Unsigned> ImmList<T> for VectorInner<T, N> {
         Length(N::to_usize())
     }
 
-    fn iter_from(&self, index: usize) -> Iter<T> {
+    fn iter_from(&self, index: usize) -> Iter<'_, T> {
         Iter::from_index(index, &self.tree, self.depth, Length(N::to_usize()))
+    }
+
+    fn level_iter_from(&self, index: usize) -> LevelIter<'_, T> {
+        LevelIter::from_index(index, &self.tree, self.depth, Length(N::to_usize()))
     }
 }
 
@@ -233,7 +292,7 @@ where
     }
 }
 
-impl<T: Default + Value, N: Unsigned> Default for Vector<T, N> {
+impl<T: Default + Value, N: Unsigned, U: UpdateMap<T>> Default for Vector<T, N, U> {
     fn default() -> Self {
         Self::from_elem(T::default()).unwrap_or_else(|e| {
             panic!(
@@ -245,7 +304,7 @@ impl<T: Default + Value, N: Unsigned> Default for Vector<T, N> {
     }
 }
 
-impl<T: Value + Send + Sync, N: Unsigned> tree_hash::TreeHash for Vector<T, N> {
+impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>> tree_hash::TreeHash for Vector<T, N, U> {
     fn tree_hash_type() -> tree_hash::TreeHashType {
         tree_hash::TreeHashType::Vector
     }
@@ -265,10 +324,11 @@ impl<T: Value + Send + Sync, N: Unsigned> tree_hash::TreeHash for Vector<T, N> {
     }
 }
 
-impl<T, N> TryFromIter<T> for Vector<T, N>
+impl<T, N, U> TryFromIter<T> for Vector<T, N, U>
 where
     T: Value,
     N: Unsigned,
+    U: UpdateMap<T>,
 {
     type Error = Error;
 
@@ -290,7 +350,7 @@ impl<'a, T: Value, N: Unsigned, U: UpdateMap<T>> IntoIterator for &'a Vector<T, 
 }
 
 // FIXME: duplicated from `ssz::encode::impl_for_vec`
-impl<T: Value, N: Unsigned> Encode for Vector<T, N> {
+impl<T: Value, N: Unsigned, U: UpdateMap<T>> Encode for Vector<T, N, U> {
     fn is_ssz_fixed_len() -> bool {
         <T as Encode>::is_ssz_fixed_len()
     }
@@ -332,7 +392,7 @@ impl<T: Value, N: Unsigned> Encode for Vector<T, N> {
     }
 }
 
-impl<T: Value, N: Unsigned> Decode for Vector<T, N> {
+impl<T: Value, N: Unsigned, U: UpdateMap<T>> Decode for Vector<T, N, U> {
     fn is_ssz_fixed_len() -> bool {
         <T as Decode>::is_ssz_fixed_len()
     }
@@ -346,11 +406,10 @@ impl<T: Value, N: Unsigned> Decode for Vector<T, N> {
     }
 
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
-        let list = List::from_ssz_bytes(bytes).map_err(|e| {
-            ssz::DecodeError::BytesInvalid(format!("Error decoding vector: {:?}", e))
-        })?;
+        let list = List::from_ssz_bytes(bytes)
+            .map_err(|e| ssz::DecodeError::BytesInvalid(format!("Error decoding vector: {e:?}")))?;
         Self::try_from(list).map_err(|e| {
-            ssz::DecodeError::BytesInvalid(format!("Wrong number of vector elements: {:?}", e))
+            ssz::DecodeError::BytesInvalid(format!("Wrong number of vector elements: {e:?}"))
         })
     }
 }

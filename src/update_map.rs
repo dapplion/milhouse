@@ -1,7 +1,6 @@
 use crate::cow::{BTreeCow, Cow, VecCow};
 use crate::utils::max_btree_index;
-use arbitrary::Arbitrary;
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::ops::ControlFlow;
 use vec_map::VecMap;
 
@@ -160,7 +159,6 @@ impl<T: Clone> UpdateMap<T> for VecMap<T> {
     }
 
     fn max_index(&self) -> Option<usize> {
-        // FIXME(sproul): this is slow, make a wrapper type that tracks the max index
         self.keys().next_back()
     }
 
@@ -169,10 +167,14 @@ impl<T: Clone> UpdateMap<T> for VecMap<T> {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Arbitrary)]
-#[arbitrary(bound = "M: Default")]
+#[derive(Debug, Default, Clone, PartialEq)]
+#[cfg_attr(
+    feature = "arbitrary",
+    derive(arbitrary::Arbitrary),
+    arbitrary(bound = "M: Default")
+)]
 pub struct MaxMap<M> {
-    #[arbitrary(default)]
+    #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     inner: M,
     max_key: usize,
 }

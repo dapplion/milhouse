@@ -2,40 +2,49 @@ use crate::builder::Builder;
 use crate::interface::{ImmList, Interface, MutList};
 use crate::interface_iter::{InterfaceIter, InterfaceIterCow};
 use crate::iter::Iter;
+use crate::level_iter::{LevelIter, LevelNode};
 use crate::serde::ListVisitor;
-use crate::tree::RebaseAction;
+use crate::tree::{IntraRebaseAction, RebaseAction};
 use crate::update_map::MaxMap;
-use crate::utils::{arb_arc, int_log, opt_packing_depth, updated_length, Length};
+use crate::utils::{Length, compute_level, int_log, opt_packing_depth, updated_length};
 use crate::{Arc, Cow, Error, Tree, UpdateMap, Value};
+#[cfg(feature = "arbitrary")]
 use arbitrary::Arbitrary;
-use derivative::Derivative;
+use educe::Educe;
 use itertools::process_results;
-use serde::{ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
-use ssz::{Decode, Encode, SszEncoder, TryFromIter, BYTES_PER_LENGTH_OFFSET};
-use std::collections::BTreeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeSeq};
+use ssz::{BYTES_PER_LENGTH_OFFSET, Decode, Encode, SszEncoder, TryFromIter};
+use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 use tree_hash::{Hash256, PackedEncoding, TreeHash};
 use typenum::Unsigned;
 use vec_map::VecMap;
-
-#[derive(Debug, Clone, Derivative, Arbitrary)]
-#[derivative(PartialEq(bound = "T: Value, N: Unsigned, U: UpdateMap<T> + PartialEq"))]
-#[arbitrary(bound = "T: Arbitrary<'arbitrary> + Value")]
-#[arbitrary(bound = "N: Unsigned, U: Arbitrary<'arbitrary> + UpdateMap<T> + PartialEq")]
+#[derive(Debug, Clone, Educe)]
+#[educe(PartialEq(bound(T: Value, N: Unsigned, U: UpdateMap<T> + PartialEq)))]
+#[cfg_attr(
+    feature = "arbitrary",
+    derive(Arbitrary),
+    arbitrary(bound = "T: Arbitrary<'arbitrary> + Value"),
+    arbitrary(bound = "N: Unsigned, U: Arbitrary<'arbitrary> + UpdateMap<T> + PartialEq")
+)]
 pub struct List<T: Value, N: Unsigned, U: UpdateMap<T> = MaxMap<VecMap<T>>> {
     pub(crate) interface: Interface<T, ListInner<T, N>, U>,
 }
 
-#[derive(Debug, Clone, Derivative, Arbitrary)]
-#[derivative(PartialEq(bound = "T: Value, N: Unsigned"))]
-#[arbitrary(bound = "T: Arbitrary<'arbitrary> + Value, N: Unsigned")]
+#[derive(Debug, Clone, Educe)]
+#[educe(PartialEq(bound(T: Value, N: Unsigned)))]
+#[cfg_attr(
+    feature = "arbitrary",
+    derive(Arbitrary),
+    arbitrary(bound = "T: Arbitrary<'arbitrary> + Value, N: Unsigned")
+)]
 pub struct ListInner<T: Value, N: Unsigned> {
-    #[arbitrary(with = arb_arc)]
+    #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_arc))]
     pub(crate) tree: Arc<Tree<T>>,
     pub(crate) length: Length,
     pub(crate) depth: usize,
     pub(crate) packing_depth: usize,
-    #[arbitrary(default)]
+    #[cfg_attr(feature = "arbitrary", arbitrary(default))]
     _phantom: PhantomData<N>,
 }
 
@@ -69,21 +78,27 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
     }
 
     pub fn repeat_slow(elem: T, n: usize) -> Result<Self, Error> {
-        Self::try_from_iter(std::iter::repeat(elem).take(n))
+        Self::try_from_iter(std::iter::repeat_n(elem, n))
     }
 
-    pub fn builder() -> Builder<T> {
-        Builder::new(Self::depth())
+    pub fn builder() -> Result<Builder<T>, Error> {
+        Builder::new(Self::depth(), 0)
     }
 
     pub fn try_from_iter(iter: impl IntoIterator<Item = T>) -> Result<Self, Error> {
-        let mut builder = Self::builder();
+        let mut builder = Self::builder()?;
 
         for item in iter.into_iter() {
             builder.push(item)?;
         }
 
         let (tree, depth, length) = builder.finish()?;
+
+        // Check the length to cover the case where the capacity implied by packing_depth is
+        // greater than N. E.g. the builder might pack up to 32 u8s, even if N is < 32.
+        if length.as_usize() > N::to_usize() {
+            return Err(Error::BuilderFull);
+        }
 
         Ok(Self::from_parts(tree, depth, length))
     }
@@ -106,11 +121,11 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
         self.iter().cloned().collect()
     }
 
-    pub fn iter(&self) -> InterfaceIter<T, U> {
+    pub fn iter(&self) -> InterfaceIter<'_, T, U> {
         self.interface.iter()
     }
 
-    pub fn iter_from(&self, index: usize) -> Result<InterfaceIter<T, U>, Error> {
+    pub fn iter_from(&self, index: usize) -> Result<InterfaceIter<'_, T, U>, Error> {
         // Return an empty iterator at index == length, just like slicing.
         if index > self.len() {
             return Err(Error::OutOfBoundsIterFrom {
@@ -121,20 +136,59 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
         Ok(self.interface.iter_from(index))
     }
 
-    pub fn iter_cow(&mut self) -> InterfaceIterCow<T, U> {
+    /// Iterate all internal nodes on the same level as `index`.
+    pub fn level_iter_from(&self, index: usize) -> Result<LevelIter<'_, T>, Error> {
+        // Return an empty iterator at index == length, just like slicing.
+        if index > self.len() {
+            return Err(Error::OutOfBoundsIterFrom {
+                index,
+                len: self.len(),
+            });
+        }
+        self.interface.level_iter_from(index)
+    }
+
+    pub fn iter_cow(&mut self) -> InterfaceIterCow<'_, T, U> {
         self.interface.iter_cow()
     }
 
+    pub fn iter_cow_from(&mut self, index: usize) -> Result<InterfaceIterCow<'_, T, U>, Error> {
+        if index > self.len() {
+            return Err(Error::OutOfBoundsIterFrom {
+                index,
+                len: self.len(),
+            });
+        }
+        Ok(self.interface.iter_cow_from(index))
+    }
+
+    /// Compute the bytes owned by `self` that are not shared with `base`.
+    ///
+    /// O(dirty_nodes) — shared subtrees are skipped via `Arc::ptr_eq`.
+    pub fn cow_bytes(&self, base: &Self) -> usize {
+        crate::mem::cow_tree_bytes(&base.interface.backing.tree, &self.interface.backing.tree)
+    }
+
+    /// Total bytes of all tree nodes (no sharing baseline).
+    pub fn total_tree_bytes(&self) -> usize {
+        crate::mem::total_tree_bytes(&self.interface.backing.tree)
+    }
+
+    /// Access the internal tree root for use with `total_unique_cow_tree_bytes`.
+    pub fn tree_root(&self) -> &Arc<Tree<T>> {
+        &self.interface.backing.tree
+    }
+
     // Wrap trait methods so we present a Vec-like interface without having to import anything.
-    pub fn get(&self, index: usize) -> Option<&T> {
+    pub fn get(&self, index: usize) -> Option<&'_ T> {
         self.interface.get(index)
     }
 
-    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+    pub fn get_mut(&mut self, index: usize) -> Option<&'_ mut T> {
         self.interface.get_mut(index)
     }
 
-    pub fn get_cow(&mut self, index: usize) -> Option<Cow<T>> {
+    pub fn get_cow(&mut self, index: usize) -> Option<Cow<'_, T>> {
         self.interface.get_cow(index)
     }
 
@@ -169,6 +223,54 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
             int_log(N::to_usize())
         }
     }
+
+    /// Remove `n` elements from the front of `self`.
+    ///
+    /// Errors if `n > self.len()`.
+    pub fn pop_front_slow(&mut self, n: usize) -> Result<(), Error> {
+        *self = Self::try_from_iter(self.iter_from(n)?.cloned())?;
+        Ok(())
+    }
+
+    /// Remove `n` elements from the front of `self`.
+    ///
+    /// Errors if `n > self.len()`.
+    pub fn pop_front(&mut self, n: usize) -> Result<(), Error> {
+        self.apply_updates()?;
+
+        if n == 0 {
+            return Ok(());
+        }
+
+        let depth = Self::depth();
+        let packing_depth = opt_packing_depth::<T>().unwrap_or(0);
+        let level = compute_level(n, depth, packing_depth);
+        let mut builder = Builder::new(Self::depth(), level)?;
+        let mut level_iter = self.level_iter_from(n)?.peekable();
+
+        while let Some(item) = level_iter.next() {
+            match item {
+                LevelNode::Internal(node) => {
+                    let last = level_iter.peek().is_none();
+                    let subtree_len = if !last {
+                        1 << level
+                    } else {
+                        // Slower, but we only need to do this once.
+                        node.compute_len()
+                    };
+                    builder.push_node(node.clone(), subtree_len)?;
+                }
+                LevelNode::PackedLeaf(value) => {
+                    builder.push(value.clone())?;
+                }
+            }
+        }
+
+        let (tree, depth, length) = builder.finish()?;
+        *self = Self::from_parts(tree, depth, length);
+
+        Ok(())
+    }
 }
 
 impl<T: Value, N: Unsigned> ImmList<T> for ListInner<T, N> {
@@ -185,8 +287,12 @@ impl<T: Value, N: Unsigned> ImmList<T> for ListInner<T, N> {
         self.length
     }
 
-    fn iter_from(&self, index: usize) -> Iter<T> {
+    fn iter_from(&self, index: usize) -> Iter<'_, T> {
         Iter::from_index(index, &self.tree, self.depth, self.length)
+    }
+
+    fn level_iter_from(&self, index: usize) -> LevelIter<'_, T> {
+        LevelIter::from_index(index, &self.tree, self.depth, self.length)
     }
 }
 
@@ -265,13 +371,32 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
     }
 }
 
-impl<T: Value, N: Unsigned> Default for List<T, N> {
+impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
+    pub fn intra_rebase(&mut self) -> Result<(), Error> {
+        // We need to be fully hashed in order to intra-rebase. To avoid putting this burden on the
+        // caller, just do it here. If we're already fully-hashed this should be quick.
+        self.apply_updates()?;
+        self.tree_hash_root();
+
+        let mut known_subtrees = HashMap::new();
+        if let IntraRebaseAction::Replace(new_tree) = Tree::intra_rebase(
+            &self.interface.backing.tree,
+            &mut known_subtrees,
+            self.interface.backing.depth,
+        )? {
+            self.interface.backing.tree = new_tree;
+        }
+        Ok(())
+    }
+}
+
+impl<T: Value, N: Unsigned, U: UpdateMap<T>> Default for List<T, N, U> {
     fn default() -> Self {
         Self::empty()
     }
 }
 
-impl<T: Value + Send + Sync, N: Unsigned> TreeHash for List<T, N> {
+impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>> TreeHash for List<T, N, U> {
     fn tree_hash_type() -> tree_hash::TreeHashType {
         tree_hash::TreeHashType::List
     }
@@ -333,7 +458,7 @@ where
 }
 
 // FIXME: duplicated from `ssz::encode::impl_for_vec`
-impl<T: Value, N: Unsigned> Encode for List<T, N> {
+impl<T: Value, N: Unsigned, U: UpdateMap<T>> Encode for List<T, N, U> {
     fn is_ssz_fixed_len() -> bool {
         false
     }
@@ -367,10 +492,11 @@ impl<T: Value, N: Unsigned> Encode for List<T, N> {
     }
 }
 
-impl<T, N> TryFromIter<T> for List<T, N>
+impl<T, N, U> TryFromIter<T> for List<T, N, U>
 where
     T: Value,
     N: Unsigned,
+    U: UpdateMap<T>,
 {
     type Error = Error;
 
@@ -382,10 +508,11 @@ where
     }
 }
 
-impl<T, N> Decode for List<T, N>
+impl<T, N, U> Decode for List<T, N, U>
 where
     T: Value,
     N: Unsigned,
+    U: UpdateMap<T>,
 {
     fn is_ssz_fixed_len() -> bool {
         false
@@ -404,8 +531,7 @@ where
 
             if num_items > max_len {
                 return Err(ssz::DecodeError::BytesInvalid(format!(
-                    "List of {} items exceeds maximum of {}",
-                    num_items, max_len
+                    "List of {num_items} items exceeds maximum of {max_len}"
                 )));
             }
 
@@ -415,7 +541,7 @@ where
                     .map(T::from_ssz_bytes),
                 |iter| {
                     List::try_from_iter(iter).map_err(|e| {
-                        ssz::DecodeError::BytesInvalid(format!("Error building ssz List: {:?}", e))
+                        ssz::DecodeError::BytesInvalid(format!("Error building ssz List: {e:?}"))
                     })
                 },
             )?

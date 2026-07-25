@@ -1,13 +1,13 @@
 use crate::List;
 use tree_hash::Hash256;
-use typenum::{Unsigned, U16, U32};
+use typenum::{U16, U32, Unsigned};
 
 #[test]
 fn build_partial_hash256_list() {
     type N = U16;
     let n = N::to_usize();
     let vec = (0..n as u64)
-        .map(Hash256::from_low_u64_be)
+        .map(|n| Hash256::right_padding_from(&n.to_le_bytes()))
         .collect::<Vec<_>>();
 
     for k in 0..n {

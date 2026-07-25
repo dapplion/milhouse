@@ -1,11 +1,12 @@
-use super::{arb_hash256, arb_index, arb_large, arb_list, arb_vect, Large};
+use super::{Large, arb_hash256, arb_index, arb_large, arb_list, arb_vect};
 use crate::{Error, List, Value, Vector};
 use proptest::prelude::*;
 use ssz::{Decode, Encode};
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::ops::Deref;
 use tree_hash::{Hash256, TreeHash};
-use typenum::{Unsigned, U1, U1024, U2, U3, U32, U33, U4, U7, U8, U9};
+use typenum::{U1, U2, U3, U4, U7, U8, U9, U32, U33, U1024, Unsigned};
 
 const OP_LIMIT: usize = 128;
 
@@ -17,7 +18,7 @@ pub struct Spec<T, N: Unsigned> {
     _phantom: PhantomData<N>,
 }
 
-impl<T, N: Unsigned> Spec<T, N> {
+impl<T: Value, N: Unsigned> Spec<T, N> {
     pub fn list(values: Vec<T>) -> Self {
         assert!(values.len() <= N::to_usize());
         Self {
@@ -47,6 +48,18 @@ impl<T, N: Unsigned> Spec<T, N> {
     pub fn iter_from(&self, index: usize) -> Result<impl Iterator<Item = &T>, Error> {
         if index <= self.len() {
             Ok(self.values[index..].iter())
+        } else {
+            Err(Error::OutOfBoundsIterFrom {
+                index,
+                len: self.len(),
+            })
+        }
+    }
+
+    pub fn pop_front(&mut self, index: usize) -> Result<(), Error> {
+        if index <= self.len() {
+            self.values = self.values[index..].to_vec();
+            Ok(())
         } else {
             Err(Error::OutOfBoundsIterFrom {
                 index,
@@ -97,6 +110,10 @@ pub enum Op<T> {
     Iter,
     /// Check the `iter_from` method.
     IterFrom(usize),
+    /// Check the `iter_cow_from` method.
+    IterCowFrom(usize),
+    /// Check the `pop_front` method.
+    PopFront(usize),
     /// Apply updates to the backing list.
     ApplyUpdates,
     /// Compute the tree hash of the list, modifying its internal nodes.
@@ -109,6 +126,8 @@ pub enum Op<T> {
     Debase,
     /// Roundtrip via a list/vect using the TryFrom/From implementations.
     FromIntoRoundtrip,
+    /// Rebase the list on itself to exploit self-sharing.
+    IntraRebase,
 }
 
 fn arb_op<'a, T, S>(strategy: &'a S, n: usize) -> impl Strategy<Value = Op<T>> + 'a
@@ -128,18 +147,21 @@ where
         strategy.prop_map(Op::Push),
         Just(Op::Iter),
         arb_index(n).prop_map(Op::IterFrom),
-        Just(Op::ApplyUpdates),
-        Just(Op::TreeHash),
+        arb_index(n).prop_map(Op::IterCowFrom),
+        arb_index(n).prop_map(Op::PopFront),
     ];
     let b_block = prop_oneof![
+        Just(Op::ApplyUpdates),
+        Just(Op::TreeHash),
         Just(Op::Checkpoint),
         Just(Op::Rebase),
         Just(Op::Debase),
-        Just(Op::FromIntoRoundtrip)
+        Just(Op::FromIntoRoundtrip),
+        Just(Op::IntraRebase),
     ];
     prop_oneof![
         10 => a_block,
-        4 => b_block
+        7 => b_block
     ]
 }
 
@@ -197,6 +219,30 @@ where
                 (Err(e1), Err(e2)) => assert_eq!(e1, e2),
                 (Err(e), _) | (_, Err(e)) => panic!("iter_from mismatch: {}", e),
             },
+            Op::IterCowFrom(index) => match (list.iter_cow_from(index), spec.iter_from(index)) {
+                (Ok(mut cow_iter), Ok(spec_iter)) => {
+                    let mut cow_values = Vec::new();
+                    while let Some((idx, cow)) = cow_iter.next_cow() {
+                        assert_eq!(
+                            idx,
+                            index + cow_values.len(),
+                            "index mismatch in iter_cow_from"
+                        );
+                        cow_values.push(cow.deref().clone());
+                    }
+                    assert!(cow_values.iter().eq(spec_iter));
+                }
+                (Err(e1), Err(e2)) => assert_eq!(e1, e2),
+                (Err(e), _) | (_, Err(e)) => panic!("iter_cow_from mismatch: {}", e),
+            },
+            Op::PopFront(index) => match (list.pop_front(index), spec.pop_front(index)) {
+                (Ok(()), Ok(())) => {
+                    assert_eq!(list.len(), spec.len());
+                    assert!(list.iter().eq(spec.iter()))
+                }
+                (Err(e1), Err(e2)) => assert_eq!(e1, e2),
+                (Err(e), _) | (_, Err(e)) => panic!("pop_front mismatch: {}", e),
+            },
             Op::ApplyUpdates => {
                 list.apply_updates().unwrap();
             }
@@ -228,6 +274,16 @@ where
                     // process when there are pending updates.
                     assert!(list.iter().eq(re_list.iter()));
                 }
+            }
+            Op::IntraRebase => {
+                let mut new_list = list.clone();
+                new_list.intra_rebase().unwrap();
+
+                list.apply_updates().unwrap();
+                list.tree_hash_root();
+
+                assert_eq!(new_list, *list);
+                *list = new_list;
             }
         }
     }
@@ -275,6 +331,25 @@ where
                 (Err(e1), Err(e2)) => assert_eq!(e1, e2),
                 (Err(e), _) | (_, Err(e)) => panic!("iter_from mismatch: {}", e),
             },
+            Op::IterCowFrom(index) => match (vect.iter_cow_from(index), spec.iter_from(index)) {
+                (Ok(mut cow_iter), Ok(spec_iter)) => {
+                    let mut cow_values = Vec::new();
+                    while let Some((idx, cow)) = cow_iter.next_cow() {
+                        assert_eq!(
+                            idx,
+                            index + cow_values.len(),
+                            "index mismatch in iter_cow_from"
+                        );
+                        cow_values.push(cow.deref().clone());
+                    }
+                    assert!(cow_values.iter().eq(spec_iter));
+                }
+                (Err(e1), Err(e2)) => assert_eq!(e1, e2),
+                (Err(e), _) | (_, Err(e)) => panic!("iter_cow_from mismatch: {}", e),
+            },
+            Op::PopFront(_) => {
+                // No-op
+            }
             Op::ApplyUpdates => {
                 vect.apply_updates().unwrap();
             }
@@ -303,6 +378,16 @@ where
                 if let Ok(re_vect) = Vector::try_from(list) {
                     assert!(vect.iter().eq(re_vect.iter()));
                 }
+            }
+            Op::IntraRebase => {
+                let mut new_vect = vect.clone();
+                new_vect.intra_rebase().unwrap();
+
+                vect.apply_updates().unwrap();
+                vect.tree_hash_root();
+
+                assert_eq!(new_vect, *vect);
+                *vect = new_vect;
             }
         }
     }
