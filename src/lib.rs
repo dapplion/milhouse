@@ -1,6 +1,7 @@
 #![allow(clippy::comparison_chain)]
 #![deny(clippy::unwrap_used)]
 
+mod batch_hash;
 pub mod builder;
 pub mod cow;
 pub mod error;

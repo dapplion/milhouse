@@ -11,7 +11,9 @@ keywords = ["ethereum", "functional"]
 categories = ["data-structures", "cryptography::cryptocurrencies"]
 
 [features]
+default = ["hashtree"]
 debug = []
+hashtree = ["dep:hashtree-rs"]
 arbitrary = ["dep:arbitrary", "alloy-primitives/arbitrary"]
 context_deserialize = ["dep:context_deserialize"]
 
@@ -32,6 +34,9 @@ smallvec = "1.8.0"
 arbitrary = { version = "1.2.3", features = ["derive"], optional = true }
 alloy-primitives = { version = "1.0.0" }
 context_deserialize = { version = "0.2", optional = true }
+
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
+hashtree-rs = { version = "0.2.5", optional = true }
 
 [dev-dependencies]
 ssz_types = "0.14"

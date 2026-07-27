@@ -517,7 +517,7 @@ impl<T: Value + Send + Sync> Tree<T> {
             }
             Self::PackedLeaf(leaf) => leaf.tree_hash(),
             Self::Zero(depth) => Hash256::from(ZERO_HASHES[*depth]),
-            Self::Node { hash, left, right } => {
+            Self::Node { hash, .. } => {
                 let read_lock = hash.read();
                 let existing_hash = *read_lock;
                 drop(read_lock);
@@ -525,15 +525,142 @@ impl<T: Value + Send + Sync> Tree<T> {
                 if !existing_hash.is_zero() {
                     existing_hash
                 } else {
-                    // Parallelism goes brrrr.
-                    let (left_hash, right_hash) =
-                        rayon::join(|| left.tree_hash(), || right.tree_hash());
-                    let tree_hash =
-                        Hash256::from(hash32_concat(left_hash.as_slice(), right_hash.as_slice()));
-                    *hash.write() = tree_hash;
-                    tree_hash
+                    self.tree_hash_dirty(Self::PARALLEL_SPLIT_BUDGET)
                 }
             }
+        }
+    }
+
+    /// Number of rayon splits allowed while descending into a dirty tree, i.e. up to
+    /// `2^BUDGET` concurrently hashed subtrees. Splits are only spent where both
+    /// subtrees are dirty, so spines of single-child updates descend for free.
+    const PARALLEL_SPLIT_BUDGET: usize = 6;
+
+    /// Hash a dirty interior node, forking across the rayon pool while both
+    /// subtrees are dirty and the split budget allows, then hashing each
+    /// sequential subtree in level-order batches.
+    fn tree_hash_dirty(&self, budget: usize) -> Hash256 {
+        let Self::Node { hash, left, right } = self else {
+            return self.tree_hash();
+        };
+
+        let left_dirty = Self::is_dirty_node(left);
+        let right_dirty = Self::is_dirty_node(right);
+        let tree_hash = match (left_dirty, right_dirty, budget) {
+            (true, true, 1..) => {
+                let (left_hash, right_hash) = rayon::join(
+                    || left.tree_hash_dirty(budget - 1),
+                    || right.tree_hash_dirty(budget - 1),
+                );
+                Hash256::from(hash32_concat(left_hash.as_slice(), right_hash.as_slice()))
+            }
+            (true, false, 1..) => {
+                let left_hash = left.tree_hash_dirty(budget);
+                Hash256::from(hash32_concat(
+                    left_hash.as_slice(),
+                    right.tree_hash().as_slice(),
+                ))
+            }
+            (false, true, 1..) => {
+                let right_hash = right.tree_hash_dirty(budget);
+                Hash256::from(hash32_concat(
+                    left.tree_hash().as_slice(),
+                    right_hash.as_slice(),
+                ))
+            }
+            _ => return self.tree_hash_batched(),
+        };
+        *hash.write() = tree_hash;
+        tree_hash
+    }
+
+    fn is_dirty_node(tree: &Self) -> bool {
+        matches!(tree, Self::Node { hash, .. } if hash.read().is_zero())
+    }
+
+    /// Compute the root of a dirty interior node by hashing dirty descendants in
+    /// level-order batches instead of per-node recursion: dirty leaves first, then
+    /// each level of dirty interior nodes bottom-up, one batched hash call per
+    /// level, letting the backend hash many independent 64-byte blocks at once.
+    fn tree_hash_batched(&self) -> Hash256 {
+        let mut levels: Vec<Vec<&Self>> = Vec::new();
+        let mut dirty_leaves: Vec<&Leaf<T>> = Vec::new();
+        let mut frontier = vec![self];
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for node in &frontier {
+                let Self::Node { left, right, .. } = node else {
+                    continue;
+                };
+                for child in [left, right] {
+                    match child.as_ref() {
+                        Self::Node { hash, .. } => {
+                            if hash.read().is_zero() {
+                                next.push(child.as_ref());
+                            }
+                        }
+                        Self::Leaf(leaf) => {
+                            if leaf.hash.read().is_zero() {
+                                dirty_leaves.push(leaf);
+                            }
+                        }
+                        // Memoises the packed chunk; no hashing involved.
+                        Self::PackedLeaf(leaf) => {
+                            leaf.tree_hash();
+                        }
+                        Self::Zero(_) => {}
+                    }
+                }
+            }
+            let level = std::mem::replace(&mut frontier, next);
+            levels.push(level);
+        }
+
+        for &leaf in &dirty_leaves {
+            Self::hash_leaf(leaf);
+        }
+
+        for level in levels.iter().rev() {
+            Self::hash_node_batch(level);
+        }
+
+        Self::cached_hash(self)
+    }
+
+    fn hash_leaf(leaf: &Leaf<T>) {
+        let tree_hash = leaf.value.tree_hash_root();
+        *leaf.hash.write() = tree_hash;
+    }
+
+    /// Hash a batch of same-level dirty nodes whose descendants have all been hashed.
+    fn hash_node_batch(nodes: &[&Self]) {
+        let mut input = vec![0u8; nodes.len() * 64];
+        for (i, node) in nodes.iter().enumerate() {
+            let Self::Node { left, right, .. } = node else {
+                continue;
+            };
+            input[i * 64..i * 64 + 32].copy_from_slice(Self::cached_hash(left).as_slice());
+            input[i * 64 + 32..(i + 1) * 64].copy_from_slice(Self::cached_hash(right).as_slice());
+        }
+        let mut output = vec![0u8; nodes.len() * 32];
+        crate::batch_hash::hash_pairs(&input, &mut output);
+        for (i, node) in nodes.iter().enumerate() {
+            let Self::Node { hash, .. } = node else {
+                continue;
+            };
+            *hash.write() = Hash256::from_slice(&output[i * 32..(i + 1) * 32]);
+        }
+    }
+
+    /// Read a hash after all deeper levels have been hashed. A stored zero is only
+    /// legitimate for content that really hashes to zero (zero packed chunks and
+    /// zero-valued leaves), for which zero is the correct answer.
+    fn cached_hash(tree: &Self) -> Hash256 {
+        match tree {
+            Self::Node { hash, .. } => *hash.read(),
+            Self::Leaf(leaf) => *leaf.hash.read(),
+            Self::PackedLeaf(leaf) => *leaf.hash.read(),
+            Self::Zero(depth) => Hash256::from(ZERO_HASHES[*depth]),
         }
     }
 }
