@@ -633,23 +633,36 @@ impl<T: Value + Send + Sync> Tree<T> {
     }
 
     /// Hash a batch of same-level dirty nodes whose descendants have all been hashed.
+    ///
+    /// Buffers are reused via a thread-local scratch so repeated hashing does not
+    /// churn the allocator.
     fn hash_node_batch(nodes: &[&Self]) {
-        let mut input = vec![0u8; nodes.len() * 64];
-        for (i, node) in nodes.iter().enumerate() {
-            let Self::Node { left, right, .. } = node else {
-                continue;
-            };
-            input[i * 64..i * 64 + 32].copy_from_slice(Self::cached_hash(left).as_slice());
-            input[i * 64 + 32..(i + 1) * 64].copy_from_slice(Self::cached_hash(right).as_slice());
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<u8>)> =
+                const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
         }
-        let mut output = vec![0u8; nodes.len() * 32];
-        crate::batch_hash::hash_pairs(&input, &mut output);
-        for (i, node) in nodes.iter().enumerate() {
-            let Self::Node { hash, .. } = node else {
-                continue;
-            };
-            *hash.write() = Hash256::from_slice(&output[i * 32..(i + 1) * 32]);
-        }
+        SCRATCH.with(|scratch| {
+            let (input, output) = &mut *scratch.borrow_mut();
+            input.clear();
+            input.resize(nodes.len() * 64, 0);
+            output.clear();
+            output.resize(nodes.len() * 32, 0);
+            for (i, node) in nodes.iter().enumerate() {
+                let Self::Node { left, right, .. } = node else {
+                    continue;
+                };
+                input[i * 64..i * 64 + 32].copy_from_slice(Self::cached_hash(left).as_slice());
+                input[i * 64 + 32..(i + 1) * 64]
+                    .copy_from_slice(Self::cached_hash(right).as_slice());
+            }
+            crate::batch_hash::hash_pairs(input, output);
+            for (i, node) in nodes.iter().enumerate() {
+                let Self::Node { hash, .. } = node else {
+                    continue;
+                };
+                *hash.write() = Hash256::from_slice(&output[i * 32..(i + 1) * 32]);
+            }
+        });
     }
 
     /// Read a hash after all deeper levels have been hashed. A stored zero is only
